@@ -7,89 +7,263 @@
 
 import UIKit
 
-public final class Proteus: NSObject {
-    var itemSize: ItemSize = .init(width: .fractionalWidth(1), height: .fractionalHeight(1)) {
+public final class Proteus: UIView {
+    private var reusableCardCache: [String: [UIView]] = [:]
+    
+    let visibleRectExtension = 10.0
+    
+    let maxScale: CGFloat
+    
+    let inactiveCardAlpha: CGFloat
+    
+    var reloadData: (() -> Void)?
+    
+    var cardForIndex: ((Int) -> UIView?)?
+    
+    var cardsCount = 0
+    
+    let scrollView = UIScrollView()
+    
+    public var scrollDirection: ScrollDirection = .leftToRight {
         didSet {
-            if let flowLayout = view.collectionViewLayout as? ProteusFlowLayout {
-                flowLayout.itemSize = itemSize.resolvedSize(within: view.bounds.size)
+            switch scrollDirection {
+            case .rightToLeft:
+                scrollView.transform = CGAffineTransformMakeRotation(.pi)
+            case .bottomToTop:
+                scrollView.transform = CGAffineTransform(scaleX: 1, y: -1)
+            default:
+                break
             }
         }
     }
     
-    var headMargin: CGFloat = 0 {
+    var resolvedCardSize: CGSize = .zero
+    public var cardSize: CardSize = .init(width: .fractionalWidth(1), height: .fractionalHeight(1)) {
         didSet {
-            if let flowLayout = view.collectionViewLayout as? ProteusFlowLayout {
-                flowLayout.headMargin = headMargin
-            }
+            resolvedCardSize = cardSize.resolvedSize(within: bounds.size)
         }
     }
     
-    var tailMargin: CGFloat = 0
+    public var headMargin: CGFloat = 0
     
-    var lineSpacing: CGFloat = 0 {
-        didSet {
-            if let flowLayout = view.collectionViewLayout as? ProteusFlowLayout {
-                flowLayout.lineSpacing = lineSpacing
-            }
-        }
-    }
+    public var tailMargin: CGFloat = 0
     
-    var items: [UIColor] = [] {
-        didSet {
-            guard items != oldValue else { return }
-            view.reloadData()
-        }
-    }
+    public var lineSpacing: CGFloat = 0
     
-    var itemTransform: Proteus.ItemTransform = .defaultZoom {
-        didSet {
-            if let flowLayout = view.collectionViewLayout as? ProteusFlowLayout {
-                flowLayout.itemTransform = itemTransform
-            }
-        }
-    }
-    
-    var view: UICollectionView!
-    
-    public override init() {
-        super.init()
+    public init(maxScale: CGFloat, inactiveCardAlpha: CGFloat = 1) {
+        self.maxScale = maxScale
+        self.inactiveCardAlpha = inactiveCardAlpha
+        super.init(frame: .zero)
         
-        view = makeCollectionView()
-    }
-}
-
-extension Proteus: UICollectionViewDataSource {
-    public func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        items.count
+        setupScrollView()
     }
     
-    public func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
-        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "Cell", for: indexPath)
-        cell.contentView.backgroundColor = items[indexPath.row]
-        return cell
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
-}
-
-extension Proteus: UICollectionViewDelegateFlowLayout {
-    public func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, insetForSectionAt section: Int) -> UIEdgeInsets {
-        .init(top: 0, left: headMargin, bottom: 0, right: tailMargin)
-    }
-}
-
-private extension Proteus {
-    func makeCollectionView() -> UICollectionView {
-        let collectionView = UICollectionView(frame: .init(), collectionViewLayout: ProteusFlowLayout())
-//        collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        collectionView.backgroundColor = .clear
-        collectionView.isPagingEnabled = false
-        collectionView.showsHorizontalScrollIndicator = false
-        collectionView.showsVerticalScrollIndicator = false
-//        collectionView.decelerationRate = .init(rawValue: decelerationRate)
-        collectionView.semanticContentAttribute = .forceLeftToRight
-        collectionView.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "Cell")
-        collectionView.dataSource = self
-        collectionView.delegate = self
+    
+    public override func layoutSubviews() {
+        super.layoutSubviews()
         
-        return collectionView
+        scrollView.frame = bounds
+        reloadData?()
+    }
+    
+    public func dequeueConfiguredReusableCard<Card, Item>(using registration: CardRegistration<Card, Item>, for index: Int, item: Item) -> Card where Card: UIView {
+        let reuseIdentifier = String(describing: Card.self)
+        if var cards = reusableCardCache[reuseIdentifier], let card = cards.popLast() as? Card {
+            reusableCardCache[reuseIdentifier] = cards
+            card.index = index
+            registration.handler(card, index, item)
+            return card
+        } else {
+            let card = Card()
+            card.frame = CGRect(origin: .zero, size: resolvedCardSize)
+            card.index = index
+            switch scrollDirection {
+            case .rightToLeft:
+                card.transform = CGAffineTransformMakeRotation(.pi)
+            case .bottomToTop:
+                card.transform = CGAffineTransform(scaleX: 1, y: -1)
+            default:
+                break
+            }
+            
+            registration.handler(card, index, item)
+            return card
+        }
+    }
+}
+
+extension Proteus: UIScrollViewDelegate {
+    public func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        func handler(index: Int) {
+            let (originX, originY, scale) = calculateZoomTransformValues(for: index)
+            let condition1 = scrollDirection.isHorizontal
+                && ((originX > leadingPosition && originX <= leadingPosition + visibleRectExtension)
+                || (originX < trailingPosition && originX >= trailingPosition - visibleRectExtension))
+            let condition2 = !scrollDirection.isHorizontal
+                && ((originY > leadingPosition && originY <= leadingPosition + visibleRectExtension)
+                || (originY < trailingPosition && originY >= trailingPosition - visibleRectExtension))
+            if condition1 || condition2 {
+                if let card = cardForIndex?(index) {
+                    card.transform = CGAffineTransform(scaleX: scale, y: scale)
+                    card.center = CGPoint(x: originX + resolvedCardSize.width * scale * 0.5, y: originY + resolvedCardSize.height * scale * 0.5)
+                    scrollView.addSubview(card)
+                }
+            }
+        }
+        
+        let (extendedVisibleRect, leadingPosition, trailingPosition) = calculateExtendedVisibleRect()
+        
+        var records: [(Int, CGRect)] = []
+        scrollView.subviews.forEach { card in
+            let (originX, originY, scale) = calculateZoomTransformValues(for: card.index)
+            card.transform = CGAffineTransform(scaleX: scale, y: scale)
+            card.center = CGPoint(x: originX + resolvedCardSize.width * scale * 0.5, y: originY + resolvedCardSize.height * scale * 0.5)
+            if CGRectIntersectsRect(extendedVisibleRect, card.frame) {
+                records.append((card.index, card.frame))
+            } else {
+                let reuseIdentifier = String(describing: type(of: card))
+                reusableCardCache[reuseIdentifier, default: []].append(card)
+                card.removeFromSuperview()
+            }
+        }
+        
+        if records.isEmpty {
+            handler(index: 0)
+            if cardsCount > 0 {
+                handler(index: cardsCount)
+            }
+        } else {
+            records.sort { $0.0 < $1.0 }
+            let firstRecord = records[0]
+            var cardIndex = firstRecord.0
+            var cardFrame = firstRecord.1
+            var position = scrollDirection.isHorizontal ? cardFrame.minX : cardFrame.minY
+            if cardIndex > 0 {
+                if position - lineSpacing > leadingPosition {
+                    addCardToScrollView(index: cardIndex - 1)
+                }
+            }
+            
+            if let lastRecord = records.last, lastRecord.0 + 1 < cardsCount {
+                cardIndex = lastRecord.0
+                cardFrame = lastRecord.1
+                position = scrollDirection.isHorizontal ? cardFrame.maxX : cardFrame.maxY
+                if position + lineSpacing < trailingPosition {
+                    addCardToScrollView(index: cardIndex + 1)
+                }
+            }
+        }
+    }
+}
+
+extension Proteus {
+    private func setupScrollView() {
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.delegate = self
+        addSubview(scrollView)
+    }
+    
+    private func calculateExtendedVisibleRect() -> (CGRect, CGFloat, CGFloat) {
+        var extendedVisibleRect: CGRect, leadingPosition: CGFloat, trailingPosition: CGFloat
+        if scrollDirection.isHorizontal {
+            extendedVisibleRect = CGRect(x: scrollView.contentOffset.x - visibleRectExtension, y: 0, width: bounds.width + 2 * visibleRectExtension, height: bounds.height)
+            leadingPosition = scrollView.contentOffset.x - visibleRectExtension
+            trailingPosition = scrollView.contentOffset.x + bounds.width + visibleRectExtension
+        } else {
+            extendedVisibleRect = CGRect(x: 0, y: scrollView.contentOffset.y - visibleRectExtension, width: bounds.width, height: bounds.height + 2 * visibleRectExtension)
+            leadingPosition = scrollView.contentOffset.y - visibleRectExtension
+            trailingPosition = scrollView.contentOffset.y + bounds.height + visibleRectExtension
+        }
+        
+        return (extendedVisibleRect, leadingPosition, trailingPosition)
+    }
+    
+    private func addCardToScrollView(index: Int) {
+        let (originX, originY, scale) = calculateZoomTransformValues(for: index)
+        if let card = cardForIndex?(index) {
+            card.transform = CGAffineTransform(scaleX: scale, y: scale)
+            card.center = CGPoint(x: originX + resolvedCardSize.width * scale * 0.5, y: originY + resolvedCardSize.height * scale * 0.5)
+            scrollView.addSubview(card)
+        }
+    }
+    
+    func calculateZoomTransformValues(for index: Int) -> (CGFloat, CGFloat, CGFloat) {
+        let cardDimension = scrollDirection.isHorizontal ? resolvedCardSize.width : resolvedCardSize.height
+        let containerDimension = scrollDirection.isHorizontal ? scrollView.bounds.width : scrollView.bounds.height
+        let offset = scrollDirection.isHorizontal ? scrollView.contentOffset.x : scrollView.contentOffset.y
+        let cardDimensionWithSpacing = cardDimension + lineSpacing
+        let baseOffset = headMargin + cardDimensionWithSpacing * CGFloat(index)
+        
+        let largestOffset = baseOffset + cardDimensionWithSpacing + cardDimension * maxScale * 0.5 - containerDimension * 0.5
+        let middleOffset = baseOffset + cardDimension * maxScale * 0.5 - containerDimension * 0.5
+        var smallestOffset = baseOffset + cardDimension * (maxScale - 1) - containerDimension * 0.5 - cardDimension * maxScale * 0.5 - lineSpacing
+        let headCardSmallestOffset = headMargin - containerDimension * 0.5 - cardDimension * maxScale * 0.5 - lineSpacing
+        if index == 0 { smallestOffset = headCardSmallestOffset }
+        
+        var scale: CGFloat = 1
+        var originX: CGFloat = 0, originY: CGFloat = 0, a: CGFloat
+        let b = cardDimension * 0.5
+        let criticalDistance = b + b * maxScale + lineSpacing
+        let screenCenterCoordinate = offset + containerDimension * 0.5
+        if offset >= smallestOffset && offset <= middleOffset {
+            a = baseOffset - cardDimensionWithSpacing + criticalDistance - screenCenterCoordinate
+            scale = (criticalDistance * maxScale + a * (1 - maxScale) + b * (1 - maxScale * maxScale)) / (criticalDistance + b * (1 - maxScale))
+            
+            let prevCardScale = 1 + maxScale - scale
+            originX = baseOffset - cardDimensionWithSpacing + cardDimension * prevCardScale + lineSpacing
+        } else if offset > middleOffset && offset <= largestOffset {
+            a = baseOffset - screenCenterCoordinate
+            scale = (maxScale * criticalDistance - (1 - maxScale) * a) / (criticalDistance + (1 - maxScale) * b)
+            originX = baseOffset
+        } else if offset < smallestOffset {
+            if offset < headCardSmallestOffset {
+                originX = baseOffset
+            } else {
+                originX = baseOffset + cardDimension * (maxScale - 1)
+            }
+        } else {
+            originX = baseOffset
+        }
+        
+        if scrollDirection.isHorizontal {
+            originY = (scrollView.bounds.height - resolvedCardSize.height * scale) * 0.5
+        } else {
+            originY = originX
+            originX = (scrollView.bounds.width - resolvedCardSize.width * scale) * 0.5
+        }
+        
+        return (originX, originY, scale)
+    }
+}
+
+public extension Proteus {
+    struct CardRegistration<Card, Item> where Card : UIView {
+
+        public typealias Handler = (_ card: Card, _ index: Int, _ item: Item) -> Void
+        
+        fileprivate var handler: Handler
+
+        public init(handler: @escaping CardRegistration<Card, Item>.Handler) {
+            self.handler = handler
+        }
+    }
+}
+
+fileprivate extension UIView {
+    private struct AssociatedKeys {
+        static var index: UInt8 = 0
+    }
+    
+    var index: Int {
+        get {
+            return objc_getAssociatedObject(self, &AssociatedKeys.index) as? Int ?? 0
+        }
+        set {
+            objc_setAssociatedObject(self, &AssociatedKeys.index, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
     }
 }
