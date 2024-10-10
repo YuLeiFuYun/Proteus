@@ -7,97 +7,79 @@
 
 import UIKit
 
-final class ProteusFlowLayout: UICollectionViewFlowLayout {
-    var itemTransform: Proteus.ItemTransform = .defaultZoom
+public class ProteusDataSource<Item> {
+    public typealias CardProvider = (_ proteus: Proteus, _ index: Int, _ item: Item) -> UIView
     
-    var lineSpacing: CGFloat = 0
+    weak var proteus: Proteus?
     
-    var headMargin: CGFloat = 0
+    private var items: [Item] = []
     
-    override init() {
-        super.init()
+    var cardProvider: CardProvider
+    
+    public init(proteus: Proteus, cardProvider: @escaping CardProvider) {
+        self.proteus = proteus
+        self.cardProvider = cardProvider
         
-        scrollDirection = .horizontal
+        self.proteus?.reloadData = { [weak self] in
+            guard let self else { return }
+            appendItems(items)
+        }
+        
+        self.proteus?.cardForIndex = { [weak self] index in
+            guard let self, index <= items.count - 1 else { return nil }
+            return cardProvider(proteus, index, items[index])
+        }
     }
     
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    public func appendItems(_ items: [Item]) {
+        self.items = items
+        self.proteus?.cardsCount = items.count
+        proteus?.scrollView.subviews.forEach { $0.removeFromSuperview() }
+        guard let proteus, proteus.bounds.width > 0 || proteus.bounds.height > 0, !items.isEmpty else { return }
+        
+        let containerDimension = proteus.scrollDirection.isHorizontal ? proteus.bounds.width : proteus.bounds.height
+        let cardDimension = proteus.scrollDirection.isHorizontal ? proteus.resolvedCardSize.width : proteus.resolvedCardSize.height
+        let cardDimensionWithSpacing = cardDimension + proteus.lineSpacing
+        let baseOffset = proteus.headMargin + cardDimensionWithSpacing * CGFloat(items.count)
+        var contentDimension: CGFloat, scale: CGFloat = 1
+        if baseOffset + cardDimension * proteus.maxScale * 0.5 <= containerDimension * 0.5 {
+            addCardsToScrollView(range: 0..<items.count)
+            contentDimension = baseOffset + proteus.tailMargin - proteus.lineSpacing
+        } else if baseOffset + cardDimension * (proteus.maxScale - 1) - proteus.lineSpacing < containerDimension + cardDimension * proteus.maxScale * 0.5 {
+            scale = addCardsToScrollView(range: 0..<items.count)
+            contentDimension = baseOffset + proteus.tailMargin + cardDimension * (scale - 1) - proteus.lineSpacing
+        } else {
+            let base = containerDimension + proteus.visibleRectExtension - proteus.headMargin - cardDimension * (proteus.maxScale - 1)
+            let count = max(Int(min(ceil(base / cardDimensionWithSpacing), CGFloat(items.count))), 1)
+            addCardsToScrollView(range: 0..<count)
+            contentDimension = baseOffset + cardDimension * (proteus.maxScale - 1) + proteus.tailMargin - proteus.lineSpacing
+        }
+        
+        updateScrollViewContentSize(contentDimension: contentDimension)
     }
 }
 
-extension ProteusFlowLayout {
-    override func shouldInvalidateLayout(forBoundsChange newBounds: CGRect) -> Bool {
-        if case .none = itemTransform.option {
-            return super.shouldInvalidateLayout(forBoundsChange: newBounds)
-        } else {
-            return true
+private extension ProteusDataSource {
+    // 添加卡片到滚动视图
+    @discardableResult
+    func addCardsToScrollView(range: CountableRange<Int>) -> CGFloat {
+        var originX: CGFloat, originY: CGFloat, scale: CGFloat = 1.0
+        for index in range {
+            let card = cardProvider(proteus!, index, items[index])
+            (originX, originY, scale) = proteus!.calculateZoomTransformValues(for: index)
+            card.transform = CGAffineTransform(scaleX: scale, y: scale)
+            card.center = CGPoint(x: originX + proteus!.resolvedCardSize.width * scale * 0.5,
+                                  y: originY + proteus!.resolvedCardSize.height * scale * 0.5)
+            proteus!.scrollView.addSubview(card)
         }
+        return scale
     }
     
-    override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
-        if case .none = itemTransform.option { return super.layoutAttributesForElements(in: rect) }
-        
-        let attributesArray = NSArray(array: super.layoutAttributesForElements(in: rect)!, copyItems: true) as! [UICollectionViewLayoutAttributes]
-        for attributes in attributesArray {
-            switch itemTransform.option {
-            case .zoom:
-                applyZoomTransform(to: attributes)
-            case let .custom(transform):
-                transform(attributes)
-            default:
-                break
-            }
-        }
-        
-        return attributesArray
-    }
-}
-
-private extension ProteusFlowLayout {
-    func applyZoomTransform(to attributes: UICollectionViewLayoutAttributes) {
-        guard case let .zoom(maxScale, anchorPoint, inactiveItemAlpha) = itemTransform.option else { return }
-        
-        let index = attributes.indexPath.row
-        let itemWidth = itemSize.width
-        let containerWidth = collectionView!.bounds.width
-        let offset = collectionView!.contentOffset.x
-        let largestOffset = headMargin + (itemWidth + lineSpacing) * CGFloat(index + 1) + itemWidth * maxScale * 0.5 - containerWidth * 0.5
-        let middleOffset = headMargin + (itemWidth + lineSpacing) * CGFloat(index) + itemWidth * maxScale * 0.5 - containerWidth * 0.5
-        var smallestOffset = headMargin + (itemWidth + lineSpacing) * CGFloat(index) + itemWidth * (maxScale - 1) - containerWidth * 0.5 - itemWidth * maxScale * 0.5 - lineSpacing
-        let headItemSmallestOffset = headMargin - containerWidth * 0.5 - itemWidth * maxScale * 0.5 - lineSpacing
-        if index == 0 {
-            smallestOffset = headItemSmallestOffset
-        }
-        
-        var a: CGFloat
-        let b = itemSize.width * 0.5
-        let criticalDistance = b + b * maxScale + lineSpacing
-        let screenCenterX = offset + containerWidth * 0.5
-        var scale: CGFloat = 1
-        var originX: CGFloat, originY: CGFloat
-        if offset >= smallestOffset && offset <= middleOffset {
-            a = headMargin + (itemSize.width + lineSpacing) * CGFloat(attributes.indexPath.row - 1) + criticalDistance - screenCenterX
-            scale = (criticalDistance * maxScale + a * (1 - maxScale) + b * (1 - maxScale * maxScale)) / (criticalDistance + b * (1 - maxScale))
-            let prevItemScale = 1 + maxScale - scale
-            originX = headMargin + (itemSize.width + lineSpacing) * CGFloat(index - 1) + itemSize.width * prevItemScale + lineSpacing
-        } else if offset > middleOffset && offset <= largestOffset {
-            a = headMargin + (itemSize.width + lineSpacing) * CGFloat(index) - screenCenterX
-            scale = (maxScale * criticalDistance - (1 - maxScale) * a) / (criticalDistance + (1 - maxScale) * b)
-            originX = headMargin + (itemSize.width + lineSpacing) * CGFloat(index)
-        } else if offset < smallestOffset {
-            if offset < headItemSmallestOffset {
-                originX = headMargin + (itemSize.width + lineSpacing) * CGFloat(index)
-            } else {
-                originX = headMargin + (itemSize.width + lineSpacing) * CGFloat(index) + itemWidth * (maxScale - 1)
-            }
+    func updateScrollViewContentSize(contentDimension: CGFloat) {
+        if proteus!.scrollDirection.isHorizontal {
+            proteus!.scrollView.contentSize = CGSize(width: contentDimension, height: proteus!.bounds.height)
         } else {
-            originX = headMargin + (itemSize.width + lineSpacing) * CGFloat(index)
+            proteus!.scrollView.contentSize = CGSize(width: proteus!.bounds.width, height: contentDimension)
         }
-        
-        originY = (collectionView!.bounds.height - itemSize.height * scale) * 0.5
-        attributes.frame = CGRect(x: originX, y: originY, width: itemSize.width * scale, height: itemSize.height * scale)
-        let distance = originX + itemSize.width * scale * 0.5 - containerWidth * 0.5 - offset
-        attributes.zIndex = Int.max - 1 - Int(abs(distance))
-        print(attributes.indexPath.row, attributes.frame, scale, distance)
     }
 }
